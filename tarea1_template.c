@@ -1,10 +1,21 @@
+/*
+Tarea 1 
+Alumno: Ezequiel Zelaya
+Intitucion: Universidad Catolica de Asuncion - Facultad de ciencias y tecnologia
+Carrera: Electronica 
+Año: 2026
+*/
+
+
 #include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #ifdef _WIN32
 #include <io.h>
+#include <direct.h>
 #else
 #include <dirent.h>
 #endif
@@ -27,6 +38,7 @@
 #define MAX_TEXTO 256
 #define MAX_LINEA 1024
 #define MAX_RUTA 512
+#define MAX_MUESTRAS 2000
 
 // "macro" estructura
 typedef struct {
@@ -34,6 +46,11 @@ typedef struct {
     int total_metadatos;
     char campos[MAX_METADATOS][MAX_TEXTO];
     char valores[MAX_METADATOS][MAX_TEXTO];
+    int total_muestras;
+    double angle_x[MAX_MUESTRAS];
+    double linear_acceleration_z[MAX_MUESTRAS];
+    int segmentation_output[MAX_MUESTRAS];
+    int sync[MAX_MUESTRAS];
 } RegistroCSV;
 
 //funcion que busca todos los ficheros disponibles y carga sus nombres en la estructura de datos
@@ -53,6 +70,14 @@ void quitar_salto_linea(char texto[]);
 int linea_vacia(const char texto[]);
 int separar_metadata(const char linea_original[], char campo[], char valor[]);
 int buscar_campo(const RegistroCSV *registro, const char campo[]);
+void limpiar_espacios(char texto[]);
+void leer_senales(const char carpeta[], RegistroCSV registros[], int total);
+int buscar_columna(char columnas[][MAX_TEXTO], int total_columnas, const char nombre[]);
+int separar_columnas(char linea[], char columnas[][MAX_TEXTO], int max_columnas);
+void crear_csv_senales_por_sujeto(const RegistroCSV registros[], int total, const char carpeta_salida[]);
+const char *obtener_valor_campo(const RegistroCSV *registro, const char campo[]);
+void obtener_prueba_desde_nombre(const char nombre_fichero[], char prueba[], size_t tamano);
+void graficar_registro_gnuplot(const RegistroCSV *registro, double fs);
 
 int main(int argc, char *argv[]) {
     static RegistroCSV registros[MAX_ARCHIVOS];
@@ -64,24 +89,28 @@ int main(int argc, char *argv[]) {
     }
 
     total = cargar_carpeta(carpeta, registros);
-
+    printf("Carpeta usada: %s\n", carpeta);
+    printf("Archivos encontrados: %d\n", total);
     contar_metadatos(carpeta, registros, total);
     leer_campos(carpeta, registros, total);
     leer_valores(carpeta, registros, total);
+    leer_senales(carpeta, registros, total);
     imprimir_metadatos(registros, total);
 
-    return 0;
+    int i;
+
+    for (i = 0; i < total; i++) {
+        double fs;
+
+        fs = atof(obtener_valor_campo(&registros[i], "Sampling Frequency"));
+        graficar_registro_gnuplot(&registros[i], fs);
+    }
 }
 
-//------------------------------------------------------------------------------
-/*
-    Recorre la carpeta y carga solamente el nombre de cada fichero CSV
-    dentro del arreglo registros.
-*/
+
 int cargar_carpeta(const char carpeta[], RegistroCSV registros[]) {
     int total = 0;
 
-#ifdef _WIN32
     char patron[MAX_RUTA];
     struct _finddata_t datos;
     intptr_t busqueda;
@@ -102,29 +131,6 @@ int cargar_carpeta(const char carpeta[], RegistroCSV registros[]) {
     } while (_findnext(busqueda, &datos) == 0);
 
     _findclose(busqueda);
-
-#else
-    // Versión para Linux/Unix usando POSIX
-    DIR *directorio;
-    struct dirent *entrada;
-
-    directorio = opendir(carpeta);
-    if (directorio == NULL) {
-        return 0;
-    }
-
-    while ((entrada = readdir(directorio)) != NULL && total < MAX_ARCHIVOS) {
-        // Verificar si el archivo termina con .csv
-        size_t len = strlen(entrada->d_name);
-        if (len >= 4 && strcmp(entrada->d_name + len - 4, ".csv") == 0) {
-            copiar_texto(registros[total].nombre_fichero, entrada->d_name, MAX_TEXTO);
-            registros[total].total_metadatos = 0;
-            total++;
-        }
-    }
-
-    closedir(directorio);
-#endif
 
     return total;
 }
@@ -307,11 +313,31 @@ int buscar_campo(const RegistroCSV *registro, const char campo[]) {
 
     return -1;
 }
+
 //------------------------------------------------------------------------------
 /*
-    Lee los valores de cada metadato y los almacena en la estructura.
-    Utiliza la función buscar_campo para encontrar el índice correspondiente.
+    Devuelve el valor asociado a un campo de metadatos.
+
+    Ejemplo:
+    obtener_valor_campo(registro, "Sampling Frequency")
+    devuelve "62.5" si ese valor existe.
 */
+const char *obtener_valor_campo(const RegistroCSV *registro, const char campo[]) {
+    int posicion;
+
+    if (registro == NULL) {
+        return "";
+    }
+
+    posicion = buscar_campo(registro, campo);
+
+    if (posicion == -1) {
+        return "";
+    }
+
+    return registro->valores[posicion];
+}
+
 void leer_valores(const char carpeta[], RegistroCSV registros[], int total) {
     int i;
 
@@ -319,7 +345,6 @@ void leer_valores(const char carpeta[], RegistroCSV registros[], int total) {
         char ruta[MAX_RUTA];
         char linea[MAX_LINEA];
         FILE *archivo;
-        int j = 0;
 
         unir_ruta(ruta, carpeta, registros[i].nombre_fichero);
         archivo = fopen(ruta, "r");
@@ -331,7 +356,7 @@ void leer_valores(const char carpeta[], RegistroCSV registros[], int total) {
         while (fgets(linea, sizeof(linea), archivo) != NULL) {
             char campo[MAX_TEXTO];
             char valor[MAX_TEXTO];
-            int indice;
+            int posicion;
 
             quitar_salto_linea(linea);
 
@@ -340,32 +365,378 @@ void leer_valores(const char carpeta[], RegistroCSV registros[], int total) {
             }
 
             if (separar_metadata(linea, campo, valor)) {
-                indice = buscar_campo(&registros[i], campo);
-                if (indice != -1) {
-                    copiar_texto(registros[i].valores[indice], valor, MAX_TEXTO);
+                limpiar_espacios(valor);
+                posicion = buscar_campo(&registros[i], campo);
+                if (posicion != -1) {
+                    copiar_texto(registros[i].valores[posicion], valor, MAX_TEXTO);
                 }
-                j++;
             }
         }
 
         fclose(archivo);
     }
 }
-//------------------------------------------------------------------------------
-/*
-    Imprime todos los metadatos almacenados en la estructura.
-*/
+
 void imprimir_metadatos(const RegistroCSV registros[], int total) {
-    int i, j;
+    int i;
+    printf("\n");
+    printf("============================================================\n");
+    printf("RESUMEN DE METADATOS CSV\n");
+    printf("============================================================\n");
+    printf("Total de archivos encontrados: %d\n", total);
+    printf("============================================================\n\n");
 
     for (i = 0; i < total; i++) {
-        printf("\n===== %s =====", registros[i].nombre_fichero);
-        printf("\n");
+        int j;
+
+        printf("Archivo: %s\n", registros[i].nombre_fichero);
+        printf("Total de metadatos: %d\n", registros[i].total_metadatos);
+        printf("------------------------------------------------------------\n");
 
         for (j = 0; j < registros[i].total_metadatos; j++) {
-            printf("%s: %s\n", registros[i].campos[j], registros[i].valores[j]);
+            printf("%-30s : %s\n", registros[i].campos[j], registros[i].valores[j]);
+        }
+
+        printf("============================================================\n\n");
+    }
+}
+
+int separar_columnas(char linea[], char columnas[][MAX_TEXTO], int max_columnas) {
+    int total = 0;
+    char *token;
+
+    token = strtok(linea, ",");
+
+    while (token != NULL && total < max_columnas) {
+        quitar_salto_linea(token);
+        limpiar_espacios(token);
+        copiar_texto(columnas[total], token, MAX_TEXTO);
+
+        total++;
+        token = strtok(NULL, ",");
+    }
+
+    return total;
+}
+
+//------------------------------------------------------------------------------
+/*
+    Busca una columna por nombre dentro del encabezado del bloque numerico.
+*/
+int buscar_columna(char columnas[][MAX_TEXTO], int total_columnas, const char nombre[]) {
+    int i;
+
+    for (i = 0; i < total_columnas; i++) {
+        if (strcmp(columnas[i], nombre) == 0) {
+            return i;
         }
     }
 
-    printf("\n");
+    return -1;
+}
+
+//------------------------------------------------------------------------------
+/*
+    Lee las señales numericas del bloque posterior a la linea vacia.
+
+    Guarda solamente:
+    - angle_x
+    - linear_acceleration_z
+    - segmentation_output
+    - sync
+*/
+void leer_senales(const char carpeta[], RegistroCSV registros[], int total) {
+    int i;
+
+    for (i = 0; i < total; i++) {
+        char ruta[MAX_RUTA];
+        char linea[MAX_LINEA];
+        FILE *archivo;
+
+        int encontro_bloque_numerico = 0;
+        int total_columnas = 0;
+
+        int col_angle_x = -1;
+        int col_linear_acceleration_z = -1;
+        int col_segmentation_output = -1;
+        int col_sync = -1;
+
+        registros[i].total_muestras = 0;
+
+        unir_ruta(ruta, carpeta, registros[i].nombre_fichero);
+        archivo = fopen(ruta, "r");
+
+        if (archivo == NULL) {
+            continue;
+        }
+
+        /*
+            Primero saltamos el bloque de metadatos.
+            El bloque numerico empieza despues de la primera linea vacia.
+        */
+        while (fgets(linea, sizeof(linea), archivo) != NULL) {
+            quitar_salto_linea(linea);
+
+            if (linea_vacia(linea)) {
+                encontro_bloque_numerico = 1;
+                break;
+            }
+        }
+
+        if (!encontro_bloque_numerico) {
+            fclose(archivo);
+            continue;
+        }
+
+        /*
+            La siguiente linea despues de la linea vacia deberia ser
+            la cabecera del bloque numerico.
+        */
+        if (fgets(linea, sizeof(linea), archivo) == NULL) {
+            fclose(archivo);
+            continue;
+        }
+
+        {
+            char linea_cabecera[MAX_LINEA];
+            char columnas[100][MAX_TEXTO];
+
+            copiar_texto(linea_cabecera, linea, MAX_LINEA);
+
+            total_columnas = separar_columnas(linea_cabecera, columnas, 100);
+
+            col_angle_x = buscar_columna(columnas, total_columnas, "angle_x");
+            col_linear_acceleration_z = buscar_columna(columnas, total_columnas, "linear_acceleration_z");
+            col_segmentation_output = buscar_columna(columnas, total_columnas, "segmentation_output");
+            col_sync = buscar_columna(columnas, total_columnas, "sync");
+
+            /*
+                Por si el archivo usa nombres con mayusculas iniciales.
+            */
+            if (col_angle_x == -1) {
+                col_angle_x = buscar_columna(columnas, total_columnas, "Angle_X");
+            }
+
+            if (col_linear_acceleration_z == -1) {
+                col_linear_acceleration_z = buscar_columna(columnas, total_columnas, "Linear_Acceleration_Z");
+            }
+
+            if (col_segmentation_output == -1) {
+                col_segmentation_output = buscar_columna(columnas, total_columnas, "Segmentation_output");
+            }
+
+            if (col_sync == -1) {
+                col_sync = buscar_columna(columnas, total_columnas, "Sync");
+            }
+        }
+
+        if (col_angle_x == -1 ||
+            col_linear_acceleration_z == -1 ||
+            col_segmentation_output == -1 ||
+            col_sync == -1) {
+
+            printf("Advertencia: no se encontraron todas las columnas de senales en %s\n",
+                   registros[i].nombre_fichero);
+
+            fclose(archivo);
+            continue;
+        }
+
+        /*
+            Leemos las filas numericas.
+        */
+        while (fgets(linea, sizeof(linea), archivo) != NULL &&
+               registros[i].total_muestras < MAX_MUESTRAS) {
+
+            char linea_datos[MAX_LINEA];
+            char columnas[100][MAX_TEXTO];
+            int n;
+            int m;
+
+            quitar_salto_linea(linea);
+
+            if (linea_vacia(linea)) {
+                continue;
+            }
+
+            copiar_texto(linea_datos, linea, MAX_LINEA);
+            n = separar_columnas(linea_datos, columnas, 100);
+
+            if (col_angle_x >= n ||
+                col_linear_acceleration_z >= n ||
+                col_segmentation_output >= n ||
+                col_sync >= n) {
+                continue;
+            }
+
+            m = registros[i].total_muestras;
+
+            registros[i].angle_x[m] = atof(columnas[col_angle_x]);
+            registros[i].linear_acceleration_z[m] = atof(columnas[col_linear_acceleration_z]);
+            registros[i].segmentation_output[m] = atoi(columnas[col_segmentation_output]);
+            registros[i].sync[m] = atoi(columnas[col_sync]);
+
+            registros[i].total_muestras++;
+        }
+
+        fclose(archivo);
+
+        printf("Senales leidas en %s: %d muestras\n",
+               registros[i].nombre_fichero,
+               registros[i].total_muestras);
+    }
+}
+
+//------------------------------------------------------------------------------
+/*
+    Grafica las señales de un registro usando Gnuplot.
+
+    Genera:
+    - un archivo temporal .dat con los datos numericos
+    - un archivo temporal .plt con las instrucciones para Gnuplot
+    - una imagen .png con dos graficos:
+        1) Angle_X
+        2) Linear_Acceleration_Z
+
+    Ademas sombrea los intervalos donde Sync = 1.
+*/
+void graficar_registro_gnuplot(const RegistroCSV *registro, double fs) {
+    FILE *datos;
+    FILE *script;
+    char nombre_dat[MAX_RUTA];
+    char nombre_plt[MAX_RUTA];
+    char nombre_png[MAX_RUTA];
+    int i;
+    int objeto;
+    int dentro_intervalo;
+    double inicio_intervalo;
+    double fin_intervalo;
+
+    if (registro == NULL) {
+        return;
+    }
+
+    if (registro->total_muestras <= 0) {
+        printf("No hay muestras para graficar en %s\n", registro->nombre_fichero);
+        return;
+    }
+
+    if (fs <= 0.0) {
+        printf("Frecuencia de muestreo invalida en %s\n", registro->nombre_fichero);
+        return;
+    }
+
+    /*
+        Nombres de archivos temporales/de salida.
+        Para simplificar, usamos nombres fijos.
+    */
+    snprintf(nombre_dat, MAX_RUTA, "grafico_datos.dat");
+    snprintf(nombre_plt, MAX_RUTA, "grafico_script.plt");
+    snprintf(nombre_png, MAX_RUTA, "%s.png", registro->nombre_fichero);
+
+    /*
+        1) Crear archivo de datos.
+        Columnas:
+        tiempo, angle_x, linear_acceleration_z, segmentation_output, sync
+    */
+    datos = fopen(nombre_dat, "w");
+
+    if (datos == NULL) {
+        printf("No se pudo crear el archivo de datos para graficar.\n");
+        return;
+    }
+
+    fprintf(datos, "# tiempo angle_x linear_acceleration_z segmentation_output sync\n");
+
+    for (i = 0; i < registro->total_muestras; i++) {
+        double tiempo;
+
+        tiempo = (double)i / fs;
+
+        fprintf(datos, "%.8f %.10f %.10f %d %d\n",
+                tiempo,
+                registro->angle_x[i],
+                registro->linear_acceleration_z[i],
+                registro->segmentation_output[i],
+                registro->sync[i]);
+    }
+
+    fclose(datos);
+
+    /*
+        2) Crear script de Gnuplot.
+    */
+    script = fopen(nombre_plt, "w");
+
+    if (script == NULL) {
+        printf("No se pudo crear el script de Gnuplot.\n");
+        return;
+    }
+
+    fprintf(script, "set terminal pngcairo size 1200,800\n");
+    fprintf(script, "set output '%s'\n", nombre_png);
+
+    fprintf(script, "set multiplot layout 2,1 title '%s'\n", registro->nombre_fichero);
+
+    fprintf(script, "set grid\n");
+    fprintf(script, "set xlabel 'Tiempo [s]'\n");
+
+    /*
+        Creamos objetos de sombreado para los intervalos donde sync = 1.
+        Estos objetos se aplican sobre ambos subplots.
+    */
+    objeto = 1;
+    dentro_intervalo = 0;
+    inicio_intervalo = 0.0;
+
+    for (i = 0; i < registro->total_muestras; i++) {
+        double tiempo;
+
+        tiempo = (double)i / fs;
+
+        if (registro->sync[i] == 1 && dentro_intervalo == 0) {
+            dentro_intervalo = 1;
+            inicio_intervalo = tiempo;
+        }
+
+        if ((registro->sync[i] == 0 || i == registro->total_muestras - 1) &&
+            dentro_intervalo == 1) {
+
+            dentro_intervalo = 0;
+            fin_intervalo = tiempo;
+
+            fprintf(script,
+                    "set object %d rect from %.8f, graph 0 to %.8f, graph 1 "
+                    "fc rgb '#dddddd' fs solid 0.35 noborder behind\n",
+                    objeto,
+                    inicio_intervalo,
+                    fin_intervalo);
+
+            objeto++;
+        }
+    }
+
+    /*
+        Primer subplot: angle_x.
+    */
+    fprintf(script, "set ylabel 'Angle_X'\n");
+    fprintf(script, "plot '%s' using 1:2 with lines title 'Angle_X'\n", nombre_dat);
+
+    /*
+        Segundo subplot: linear_acceleration_z.
+    */
+    fprintf(script, "set ylabel 'Linear Acceleration Z'\n");
+    fprintf(script, "plot '%s' using 1:3 with lines title 'Linear Acceleration Z'\n", nombre_dat);
+
+    fprintf(script, "unset multiplot\n");
+    fprintf(script, "set output\n");
+
+    fclose(script);
+
+    /*
+        3) Ejecutar Gnuplot desde C.
+    */
+    system("gnuplot grafico_script.plt");
+
+    printf("Grafico generado: %s\n", nombre_png);
 }
